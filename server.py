@@ -287,21 +287,28 @@ def _set_job(akey, **kw):
         _jobs_save()
 
 
+def out_path_for(book, fmt="mp3") -> str:
+    akey = audio_key_of(book)
+    ext = "m4a" if fmt == "m4a" else "mp3"
+    name = f"{slugify(book.get('author') or 'Bilinmeyen Yazar')} - {slugify(book.get('title') or akey)}.{ext}"
+    return os.path.join(DOWNLOAD_DIR, name)
+
+
 def mp3_path_for(book) -> str:
     akey = audio_key_of(book)
-    name = f"{slugify(book.get('author') or 'Bilinmeyen Yazar')} - {slugify(book.get('title') or akey)}.mp3"
-    return os.path.join(DOWNLOAD_DIR, name), akey
+    return out_path_for(book, "mp3"), akey
 
 
-def build_mp3(book, quality="hq", threads=12, cover=True) -> str:
-    """Kitabı indirip MP3'e çevirir. Hazır dosya yolunu döndürür."""
+def build_mp3(book, quality="hq", threads=12, cover=True, fmt="mp3") -> str:
+    """Kitabı indirip MP3 (veya kopya ile M4A) üretir. Hazır dosya yolunu döndürür."""
     akey = audio_key_of(book)
     if not akey:
         raise ValueError("Ses anahtarı bulunamadı")
-    out_path, _ = mp3_path_for(book)
+    out_path = out_path_for(book, fmt)
+    job_key = akey + ("" if fmt == "mp3" else ":m4a")
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
-        _set_job(akey, state="done", progress=1.0, path=out_path)
+        _set_job(job_key, state="done", progress=1.0, path=out_path, fmt=fmt)
         return out_path
 
     segs = get_playlist(akey, quality)
@@ -309,7 +316,6 @@ def build_mp3(book, quality="hq", threads=12, cover=True) -> str:
     tmp_ts = out_path + ".part.ts"
     lock = threading.Lock()
 
-    # daha önce indirilmiş segmentler diskte duruyor → kaldığı yerden devam
     cache_dir = os.path.join(HLS_CACHE, akey if quality == "hq" else akey + "_lq")
     cached = 0
     if os.path.isdir(cache_dir):
@@ -318,8 +324,8 @@ def build_mp3(book, quality="hq", threads=12, cover=True) -> str:
         except OSError:
             cached = 0
     done = [cached]
-    _set_job(akey, state="download", progress=round(cached / total * 0.85, 4),
-             total=total, done=cached, path=out_path, resumed=cached > 0)
+    _set_job(job_key, state="download", progress=round(cached / total * 0.85, 4),
+             total=total, done=cached, path=out_path, resumed=cached > 0, fmt=fmt)
 
     with ThreadPoolExecutor(max_workers=threads) as ex, open(tmp_ts, "wb") as fh:
         pending = {}
@@ -339,27 +345,51 @@ def build_mp3(book, quality="hq", threads=12, cover=True) -> str:
             with lock:
                 done[0] += 1
                 if done[0] % 5 == 0 or done[0] == total:
-                    _set_job(akey, progress=round(done[0] / total * 0.85, 4), done=done[0])
+                    _set_job(job_key, progress=round(done[0] / total * 0.85, 4), done=done[0])
             nxt_write += 1
             submit_until(nxt_write + threads * 3)
 
-    _set_job(akey, state="encode", progress=0.86)
-    total_sec = sum((d or 0) for _u, d in segs) or 0
+    if fmt == "m4a":
+        _set_job(job_key, state="encode", progress=0.88)
+        _transcode_aac_copy(tmp_ts, out_path)
+    else:
+        _set_job(job_key, state="encode", progress=0.86)
+        total_sec = sum((d or 0) for _u, d in segs) or 0
 
-    def enc_prog(frac):
-        _set_job(akey, progress=round(0.86 + max(0.0, min(1.0, frac)) * 0.13, 4))
+        def enc_prog(frac):
+            _set_job(job_key, progress=round(0.86 + max(0.0, min(1.0, frac)) * 0.13, 4))
 
-    _transcode(tmp_ts, out_path, book, total_sec, enc_prog)
+        _transcode(tmp_ts, out_path, book, total_sec, enc_prog)
+
     try:
         os.remove(tmp_ts)
     except OSError:
         pass
-    _set_job(akey, state="done", progress=1.0, size=os.path.getsize(out_path))
+    _set_job(job_key, state="done", progress=1.0, size=os.path.getsize(out_path), fmt=fmt)
     return out_path
+
+
 
 
 def _fetch_seg(akey, quality, idx):
     return get_segment(akey, quality, idx)
+
+
+def _transcode_aac_copy(src_ts, out_m4a):
+    """AAC akışını yeniden kodlamadan .m4a kabına taşır (çok hızlı)."""
+    import av
+
+    tmp = out_m4a + ".tmp.m4a"
+    with av.open(src_ts) as inp:
+        astream = next(s for s in inp.streams if s.type == "audio")
+        with av.open(tmp, "w", format="mp4") as out:
+            ostream = out.add_stream_from_template(astream)
+            for pkt in inp.demux(astream):
+                if pkt.dts is None:
+                    continue
+                pkt.stream = ostream
+                out.mux(pkt)
+    os.replace(tmp, out_m4a)
 
 
 def _transcode(src_ts: str, out_mp3: str, book, total_sec=0, on_progress=None):
@@ -384,10 +414,12 @@ def _transcode(src_ts: str, out_mp3: str, book, total_sec=0, on_progress=None):
             ostream.layout = "stereo"
             resampler = av.AudioResampler(format="s16", layout="stereo", rate=MP3_RATE)
             done_sec = 0.0
+            tick = 0.0
             for frame in inp.decode(astream):
                 if total_sec:
                     done_sec += frame.samples / float(frame.sample_rate or 44100)
-                    if on_progress and int(done_sec) % 30 == 0:
+                    if on_progress and done_sec - tick >= 5.0:
+                        tick = done_sec
                         on_progress(done_sec / total_sec)
                 for rf in resampler.resample(frame):
                     for pkt in ostream.encode(rf):
@@ -413,26 +445,27 @@ def _add_cover(out_container, cover_url):
             out_container.mux(pkt)
 
 
-def ensure_mp3_async(book, quality="hq"):
-    """Arka planda MP3 üretimini başlatır (tek sefer)."""
+def ensure_mp3_async(book, quality="hq", fmt="mp3"):
+    """Arka planda MP3/M4A üretimini başlatır (tek sefer)."""
     akey = audio_key_of(book)
-    st = job_state(akey)
+    job_key = akey + ("" if fmt == "mp3" else ":m4a")
+    st = job_state(job_key)
     if st.get("state") in ("download", "encode", "queued"):
         return st
-    out_path, _ = mp3_path_for(book)
+    out_path = out_path_for(book, fmt)
     if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
-        _set_job(akey, state="done", progress=1.0, path=out_path)
-        return job_state(akey)
+        _set_job(job_key, state="done", progress=1.0, path=out_path, fmt=fmt)
+        return job_state(job_key)
 
     def run():
         try:
-            build_mp3(book, quality)
+            build_mp3(book, quality, fmt=fmt)
         except Exception as e:
-            _set_job(akey, state="error", error=str(e))
+            _set_job(job_key, state="error", error=str(e))
 
-    _set_job(akey, state="queued", progress=0.0)
+    _set_job(job_key, state="queued", progress=0.0, fmt=fmt)
     threading.Thread(target=run, daemon=True).start()
-    return job_state(akey)
+    return job_state(job_key)
 
 
 # ----------------------------------------------------------------------------
@@ -538,7 +571,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/appdata":
                 return self._json(build_app_data())
             if path.startswith("/api/progress/"):
-                return self._json(job_state(path.rsplit("/", 1)[-1]))
+                ak = path.rsplit("/", 1)[-1]
+                pf = "m4a" if (qs.get("f") or ["mp3"])[0] in ("m4a", "aac") else "mp3"
+                return self._json(job_state(ak + ("" if pf == "mp3" else ":m4a")))
 
             m = re.match(r"^/hls/([0-9a-f]+)/(index\.m3u8|master\.m3u8)$", path)
             if m:
@@ -612,30 +647,33 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _serve_download(self, key, qs, head_only, inline=False):
-        """MP3'ü hazır olduğunda Content-Length ile sunar; hazır değilse 202 + durum döner."""
+        """MP3/M4A hazır olduğunda sunar; hazır değilse 202 + durum döner."""
         book = book_by_key(key)
         if not book:
             return self._json({"error": "kitap bulunamadı"}, code=404)
         quality = "lq" if (qs.get("q") or ["hq"])[0] in ("lq", "low") else "hq"
-        out_path, akey = mp3_path_for(book)
+        fmt = "m4a" if (qs.get("f") or ["mp3"])[0] in ("m4a", "aac", "mp4") else "mp3"
+        akey = audio_key_of(book)
+        job_key = akey + ("" if fmt == "mp3" else ":m4a")
+        out_path = out_path_for(book, fmt)
         ready = os.path.exists(out_path) and os.path.getsize(out_path) > 1024
 
         if not ready:
-            st = job_state(akey)
+            st = job_state(job_key)
             if st.get("state") not in ("download", "encode", "queued"):
-                ensure_mp3_async(book, quality)
-                st = job_state(akey)
+                ensure_mp3_async(book, quality, fmt)
+                st = job_state(job_key)
             if head_only:
                 self.send_response(202)
                 self._cors()
                 self.end_headers()
                 return
             return self._json({"status": "preparing", "state": st.get("state", "queued"),
-                               "progress": st.get("progress", 0), "akey": akey}, code=202)
+                               "progress": st.get("progress", 0), "fmt": fmt, "akey": akey}, code=202)
 
         size = os.path.getsize(out_path)
         fname = os.path.basename(out_path)
-        ctype = "audio/mpeg"
+        ctype = "audio/mp4" if fmt == "m4a" else "audio/mpeg"
 
         # Range desteği (oynatıcı / devam ettirilebilir indirme)
         start_b, end_b = 0, size - 1
