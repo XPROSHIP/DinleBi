@@ -351,7 +351,7 @@ def build_mp3(book, quality="hq", threads=12, cover=True, fmt="mp3") -> str:
 
     if fmt == "m4a":
         _set_job(job_key, state="encode", progress=0.88)
-        _transcode_aac_copy(tmp_ts, out_path)
+        _transcode_aac_copy(tmp_ts, out_path, book)
     else:
         _set_job(job_key, state="encode", progress=0.86)
         total_sec = sum((d or 0) for _u, d in segs) or 0
@@ -376,7 +376,7 @@ def _fetch_seg(akey, quality, idx):
     return get_segment(akey, quality, idx)
 
 
-def _transcode_aac_copy(src_ts, out_m4a):
+def _transcode_aac_copy(src_ts, out_m4a, book=None):
     """AAC akışını yeniden kodlamadan .m4a kabına taşır (çok hızlı)."""
     import av
 
@@ -384,7 +384,24 @@ def _transcode_aac_copy(src_ts, out_m4a):
     with av.open(src_ts) as inp:
         astream = next(s for s in inp.streams if s.type == "audio")
         with av.open(tmp, "w", format="mp4") as out:
-            ostream = out.add_stream_from_template(astream)
+            try:
+                ostream = out.add_stream_from_template(astream)
+            except AttributeError:
+                ostream = out.add_stream(template=astream)
+            if book:
+                try:
+                    out.metadata.update({
+                        "title": book.get("title") or "",
+                        "artist": book.get("author") or "",
+                        "album": book.get("genre") or "Sesli Kitap",
+                        "album_artist": book.get("author") or "",
+                        "comment": "DinleBi · " + (book.get("narrator") or ""),
+                        "genre": book.get("genre") or "Audiobook",
+                        "date": (book.get("date_added") or "")[:4],
+                        "encoded_by": "DinleBi Downloader",
+                    })
+                except Exception:
+                    pass
             for pkt in inp.demux(astream):
                 if pkt.dts is None:
                     continue
