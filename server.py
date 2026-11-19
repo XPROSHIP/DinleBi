@@ -357,7 +357,8 @@ def build_mp3(book, quality="hq", threads=12, cover=True, fmt="mp3") -> str:
         total_sec = sum((d or 0) for _u, d in segs) or 0
 
         def enc_prog(frac):
-            _set_job(job_key, progress=round(0.86 + max(0.0, min(1.0, frac)) * 0.13, 4))
+            f = max(0.0, min(1.0, frac))
+            _set_job(job_key, progress=round(0.86 + f * 0.13, 4), enc=round(f, 4))
 
         _transcode(tmp_ts, out_path, book, total_sec, enc_prog)
 
